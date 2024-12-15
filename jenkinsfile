@@ -4,18 +4,17 @@ pipeline {
         BACKEND_IMAGE = "rajb957/cfrs-backend:latest"
         FRONTEND_IMAGE = "rajb957/cfrs-frontend:latest"
         DOCKER_CREDENTIALS = '3f9aafad-0921-4e26-9224-e77f5f69d0f0'
+        VAULT_PASSWORD_FILE = "~/.vault_key"  // Path to the vault password file
     }
     stages {
-        stage('Delete cluster')
-        {
-            steps
-            {
-                script
-                {
+        stage('Delete cluster') {
+            steps {
+                script {
                     sh 'kind delete cluster --name cfrs-cluster'
                 }
             }
         }
+
         stage('Initialize Minikube') {
             steps {
                 script {
@@ -32,10 +31,10 @@ nodes:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
 EOF
-        
+                    
                     # Configure kubectl to use the kind cluster
                     kind export kubeconfig --name cfrs-cluster
-        
+                    
                     # Fetch Minikube IP dynamically
                     MINIKUBE_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q -f "name=cfrs-cluster-control-plane"))
                     echo "${MINIKUBE_IP}" > minikube_ip.txt
@@ -44,7 +43,6 @@ EOF
                 }
             }
         }
-
 
         stage('Clone Repositories') {
             steps {
@@ -65,14 +63,53 @@ EOF
                 )
             }
         }
-        stage('Deploy Database') {
+
+        stage('Create info.txt to store database') {
             steps {
-                dir('k8s') {
-                    sh 'kubectl apply -f database-deployment.yaml'
-                    sh 'kubectl rollout status deployment/postgres'
+                script {
+                    // Create info.txt and add the database URL to it
+                    sh '''
+                    echo "postgresql://postgres:password@postgres:5432/cfrs_db" > info.txt
+                    echo "info.txt created with database URL."
+                    '''
                 }
             }
         }
+
+        stage('Encrypt database') {
+            steps {
+                script {
+                    // Encrypt info.txt before using it
+                    sh '''
+                    ansible-vault encrypt --vault-password-file ${VAULT_PASSWORD_FILE} info.txt
+                    '''
+                    echo "Encrypted info.txt"
+                }
+            }
+        }
+
+        stage('Decrypt and Deploy Database') {
+            steps {
+                script {
+                    // Decrypt info.txt file for use in the database deployment
+                    sh '''
+                    ansible-vault decrypt --vault-password-file ${VAULT_PASSWORD_FILE} info.txt
+                    '''
+                    // Extract the database URL from the decrypted file
+                    env.DATABASE_URL = sh(script: "cat info.txt", returnStdout: true).trim()
+                    echo "Decrypted Database URL: ${env.DATABASE_URL}"
+        
+                    // Replace the placeholder in the database deployment YAML with the actual DATABASE_URL
+                    sh """
+                    sed 's|__DATABASE_URL__|${env.DATABASE_URL}|g' k8s/database-deployment.yaml > k8s/database-deployment-processed.yaml
+                    kubectl apply -f k8s/database-deployment-processed.yaml
+                    kubectl rollout status deployment/postgres
+                    """
+                }
+            }
+        }
+
+
         stage('Build and Push Backend Image') {
             steps {
                 script {
@@ -84,6 +121,7 @@ EOF
                 }
             }
         }
+
         stage('Deploy Backend') {
             steps {
                 dir('k8s') {
@@ -94,6 +132,7 @@ EOF
                 }
             }
         }
+
         stage('Get Backend NodePort') {
             steps {
                 script {
@@ -118,8 +157,8 @@ EOF
                 '''
             }
         }
-        stage('Build and Push Frontend Image') 
-        {
+
+        stage('Build and Push Frontend Image') {
             steps {
                 script {
                     docker.withRegistry('', DOCKER_CREDENTIALS) {
@@ -144,8 +183,8 @@ EOF
                 }
             }
         }
-        stage('Describe Frontend')
-        {
+
+        stage('Describe Frontend') {
             steps {
                 sh '''
                 kubectl get svc cfrs-frontend
@@ -153,6 +192,7 @@ EOF
                 '''
             }
         }
+
         stage('Get frontend NodePort') {
             steps {
                 script {
@@ -160,11 +200,11 @@ EOF
                     env.MINIKUBE_IP = sh(script: "cat minikube_ip.txt", returnStdout: true).trim()
                     env.FRONTEND_NODE_PORT = sh(script: "kubectl get svc cfrs-frontend -o=jsonpath='{.spec.ports[0].nodePort}'", returnStdout: true).trim()
                     echo "Minikube IP: ${env.MINIKUBE_IP}"
-                    echo "Backend NodePort: ${env.FRONTEND_NODE_PORT}"
+                    echo "Frontend NodePort: ${env.FRONTEND_NODE_PORT}"
 
-                    def backendUrl = "http://${env.MINIKUBE_IP}:${env.FRONTEND_NODE_PORT}"
-                    echo "Setting frontend ConfigMap with backend URL: ${backendUrl}"
-                    env.BACKEND_URL = backendUrl
+                    def frontendUrl = "http://${env.MINIKUBE_IP}:${env.FRONTEND_NODE_PORT}"
+                    echo "Frontend URL: ${frontendUrl}"
+                    env.FRONTEND_URL = frontendUrl
                 }
             }
         }
